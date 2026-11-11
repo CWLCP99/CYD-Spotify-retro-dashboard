@@ -1,9 +1,12 @@
-#include "ui.h"
+// Modern theme: album cover, Spotify-green progress bar, round buttons
+#include "config.h"
+#if !UI_THEME_RETRO
 
-#include <HTTPClient.h>
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
-#include <WiFiClientSecure.h>
+
+#include "text_util.h"
+#include "ui.h"
 
 static TFT_eSPI tft;
 
@@ -19,53 +22,6 @@ static const int CTRL_X[3] = {70, 160, 250};
 static uint16_t BG, FG, GREEN, GREY, DARK;
 
 // ---------- text helpers ----------
-// The built-in fonts only have ASCII, so map accented letters to plain ones
-// (e.g. "Bad Bunny - Tití Me Preguntó" -> "Titi Me Pregunto").
-static const char* latin1ToAscii(uint32_t cp) {
-  static const char* table[64] = {
-      "A", "A", "A", "A", "A", "A", "AE", "C", "E", "E", "E", "E", "I", "I", "I", "I",
-      "D", "N", "O", "O", "O", "O", "O", "x", "O", "U", "U", "U", "U", "Y", "Th", "ss",
-      "a", "a", "a", "a", "a", "a", "ae", "c", "e", "e", "e", "e", "i", "i", "i", "i",
-      "d", "n", "o", "o", "o", "o", "o", "/", "o", "u", "u", "u", "u", "y", "th", "y"};
-  if (cp >= 0xC0 && cp <= 0xFF) return table[cp - 0xC0];
-  switch (cp) {
-    case 0xA0: return " ";
-    case 0xA1: return "!";   // ¡
-    case 0xBF: return "?";   // ¿
-    case 0x2018: case 0x2019: case 0x00B4: return "'";
-    case 0x201C: case 0x201D: return "\"";
-    case 0x2013: case 0x2014: return "-";
-    case 0x2026: return "...";
-    case 0x00B7: case 0x2022: return "-";
-  }
-  return "?";
-}
-
-static String toDisplayText(const String& in) {
-  String out;
-  out.reserve(in.length());
-  size_t i = 0;
-  while (i < in.length()) {
-    uint8_t c = in[i];
-    if (c < 0x80) {
-      out += (char)c;
-      i++;
-      continue;
-    }
-    int len;
-    uint32_t cp;
-    if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
-    else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
-    else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
-    else { i++; continue; }  // invalid byte
-    if (i + len > in.length()) break;
-    for (int k = 1; k < len; k++) cp = (cp << 6) | (in[i + k] & 0x3F);
-    i += len;
-    out += latin1ToAscii(cp);
-  }
-  return out;
-}
-
 // Draws text word-wrapped inside width w, max `maxLines`, adds "..." if cut.
 // Returns the y position below the last line.
 static int drawWrapped(String text, int x, int y, int w, int maxLines, int lineH) {
@@ -102,71 +58,11 @@ static int drawWrapped(String text, int x, int y, int w, int maxLines, int lineH
   return y;
 }
 
-static String fmtTime(uint32_t ms) {
-  uint32_t s = ms / 1000;
-  char buf[12];
-  snprintf(buf, sizeof(buf), "%lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
-  return buf;
-}
-
 // ---------- JPEG ----------
 static bool jpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (y >= H) return false;
   tft.pushImage(x, y, w, h, bitmap);
   return true;
-}
-
-// Downloads the whole JPEG into RAM (a 300px Spotify cover is ~20-60 KB)
-static uint8_t* downloadJpeg(const String& url, size_t& len) {
-  len = 0;
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10);
-  HTTPClient http;
-  http.useHTTP10(true);
-  if (!http.begin(client, url)) return nullptr;
-  if (http.GET() != 200) {
-    http.end();
-    return nullptr;
-  }
-  const size_t MAX_SIZE = 120 * 1024;
-  int total = http.getSize();
-  if (total > (int)MAX_SIZE) {
-    http.end();
-    return nullptr;
-  }
-  size_t cap = total > 0 ? total : 64 * 1024;
-  uint8_t* buf = (uint8_t*)malloc(cap);
-  if (!buf) {
-    Serial.printf("[ui] no RAM for cover (%u bytes, free heap %u)\n", cap, ESP.getFreeHeap());
-    http.end();
-    return nullptr;
-  }
-  auto* stream = http.getStreamPtr();  // WiFiClient* (core 2.x) / NetworkClient* (core 3.x)
-  uint32_t start = millis();
-  while ((total < 0 || (int)len < total) && millis() - start < 10000) {
-    size_t avail = stream->available();
-    if (!avail) {
-      if (!http.connected()) break;
-      delay(2);
-      continue;
-    }
-    if (len + avail > cap) {  // unknown size: grow the buffer
-      if (cap >= MAX_SIZE) break;
-      size_t newCap = min(cap * 2, MAX_SIZE);
-      uint8_t* nb = (uint8_t*)realloc(buf, newCap);
-      if (!nb) break;
-      buf = nb;
-      cap = newCap;
-    }
-    len += stream->readBytes(buf + len, min(avail, cap - len));
-  }
-  http.end();
-  if (len == 0 || (total > 0 && (int)len != total)) {
-    free(buf);
-    return nullptr;
-  }
-  return buf;
 }
 
 static void drawArtPlaceholder() {
@@ -196,7 +92,7 @@ void uiBegin() {
   TJpgDec.setCallback(jpgOutput);
 }
 
-void uiClear() { tft.fillScreen(BG); }
+void uiBeginPlayer() { tft.fillScreen(BG); }
 
 void uiMessage(const String& title, const String& l1, const String& l2, const String& l3) {
   tft.fillScreen(BG);
@@ -233,16 +129,12 @@ void uiDrawTrackText(const NowPlaying& np) {
   drawWrapped(toDisplayText(np.album), TEXT_X, y, TEXT_W, 2, 16);
 }
 
-bool uiDrawArt(const String& url) {
-  if (!url.length()) {
+bool uiWantsArt() { return true; }
+
+void uiDrawArtJpeg(const uint8_t* jpg, size_t len) {
+  if (!jpg || !len) {
     drawArtPlaceholder();
-    return false;
-  }
-  size_t len;
-  uint8_t* jpg = downloadJpeg(url, len);
-  if (!jpg) {
-    drawArtPlaceholder();
-    return false;
+    return;
   }
   uint16_t w = 0, h = 0;
   TJpgDec.getJpgSize(&w, &h, jpg, len);
@@ -252,8 +144,6 @@ bool uiDrawArt(const String& url) {
   int dw = w / scale, dh = h / scale;
   if (dw < ART_SIZE || dh < ART_SIZE) tft.fillRect(ART_X, ART_Y, ART_SIZE, ART_SIZE, BG);
   TJpgDec.drawJpg(ART_X + (ART_SIZE - dw) / 2, ART_Y + (ART_SIZE - dh) / 2, jpg, len);
-  free(jpg);
-  return true;
 }
 
 void uiDrawProgress(uint32_t progressMs, uint32_t durationMs) {
@@ -315,3 +205,12 @@ Button uiHitTest(int x, int y) {
   if (x < 205) return Button::PlayPause;
   return Button::Next;
 }
+
+void uiAnimate(bool, uint32_t, uint32_t) {}  // nothing animated in this theme
+
+void uiPressFeedback(Button b) {
+  int i = b == Button::Prev ? 0 : b == Button::PlayPause ? 1 : b == Button::Next ? 2 : -1;
+  if (i >= 0) tft.drawCircle(CTRL_X[i], CTRL_Y, 23, GREY);
+}
+
+#endif  // !UI_THEME_RETRO

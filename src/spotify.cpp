@@ -8,7 +8,7 @@
 
 #include "secrets.h"
 
-// read = see what's playing, modify = play/pause/skip (modify needs Premium which I have)
+// read = see what's playing, modify = play/pause/skip (modify needs Premium)
 static const char* SCOPES =
     "user-read-currently-playing user-read-playback-state user-modify-playback-state";
 static const char* API = "https://api.spotify.com/v1";
@@ -37,15 +37,25 @@ static void prepareClient(WiFiClientSecure& client) {
   client.setTimeout(10);
 }
 
+// Holds the client's mutex for the lifetime of the object
+struct Lock {
+  SemaphoreHandle_t m;
+  explicit Lock(SemaphoreHandle_t mtx) : m(mtx) { xSemaphoreTake(m, portMAX_DELAY); }
+  ~Lock() { xSemaphoreGive(m); }
+};
+
 void SpotifyClient::begin() {
+  if (!_mtx) _mtx = xSemaphoreCreateMutex();
   Preferences prefs;
   prefs.begin("spotify", false);
   _refresh = prefs.getString("refresh", "");
   prefs.end();
+  _loggedIn = _refresh.length() > 0;
 }
 
 void SpotifyClient::saveRefreshToken(const String& token) {
   _refresh = token;
+  _loggedIn = token.length() > 0;
   Preferences prefs;
   prefs.begin("spotify", false);
   if (token.length()) prefs.putString("refresh", token);
@@ -54,6 +64,7 @@ void SpotifyClient::saveRefreshToken(const String& token) {
 }
 
 void SpotifyClient::logout() {
+  Lock lock(_mtx);
   saveRefreshToken("");
   _access = "";
 }
@@ -66,6 +77,7 @@ String SpotifyClient::authorizeUrl() const {
 }
 
 bool SpotifyClient::exchangeCode(const String& code, String& err) {
+  Lock lock(_mtx);
   String body = "grant_type=authorization_code&code=" + urlEncode(code) +
                 "&redirect_uri=" + urlEncode(SPOTIFY_REDIRECT_URI);
   return tokenRequest(body, err);
@@ -104,7 +116,8 @@ bool SpotifyClient::tokenRequest(const String& body, String& err) {
     err = "HTTP " + String(status) + ": " + e + " " + desc;
     // invalid_grant = refresh token expired/revoked (they last ~6 months)
     if (status == 400 && String(e) == "invalid_grant" && body.startsWith("grant_type=refresh")) {
-      logout();
+      saveRefreshToken("");
+      _access = "";
     }
     return false;
   }
@@ -144,6 +157,7 @@ static String pickImage(JsonArrayConst images) {
 }
 
 PollResult SpotifyClient::getNowPlaying(NowPlaying& out) {
+  Lock lock(_mtx);
   if (!ensureAccessToken()) return hasRefreshToken() ? PollResult::NetError : PollResult::NeedLogin;
 
   WiFiClientSecure client;
@@ -231,6 +245,7 @@ PollResult SpotifyClient::getNowPlaying(NowPlaying& out) {
 }
 
 int SpotifyClient::command(const char* method, const char* path) {
+  Lock lock(_mtx);
   for (int attempt = 0; attempt < 2; attempt++) {
     if (!ensureAccessToken()) return -1;
     WiFiClientSecure client;
@@ -248,4 +263,56 @@ int SpotifyClient::command(const char* method, const char* path) {
     return status;
   }
   return 401;
+}
+
+uint8_t* httpDownload(const String& url, size_t& len, size_t maxSize) {
+  len = 0;
+  WiFiClientSecure client;
+  prepareClient(client);
+  HTTPClient http;
+  http.useHTTP10(true);
+  if (!http.begin(client, url)) return nullptr;
+  if (http.GET() != 200) {
+    http.end();
+    return nullptr;
+  }
+  int total = http.getSize();
+  if (total > (int)maxSize) {
+    http.end();
+    return nullptr;
+  }
+  size_t cap = total > 0 ? total : 64 * 1024;
+  uint8_t* buf = (uint8_t*)malloc(cap);
+  if (!buf) {
+    Serial.printf("[net] no RAM for download (%u bytes, free heap %lu)\n", (unsigned)cap,
+                  (unsigned long)ESP.getFreeHeap());
+    http.end();
+    return nullptr;
+  }
+  auto* stream = http.getStreamPtr();  // WiFiClient* (core 2.x) / NetworkClient* (core 3.x)
+  uint32_t start = millis();
+  while ((total < 0 || (int)len < total) && millis() - start < 10000) {
+    size_t avail = stream->available();
+    if (!avail) {
+      if (!http.connected()) break;
+      delay(2);
+      continue;
+    }
+    if (len + avail > cap) {  // unknown size: grow the buffer
+      if (cap >= maxSize) break;
+      size_t newCap = min(cap * 2, maxSize);
+      uint8_t* nb = (uint8_t*)realloc(buf, newCap);
+      if (!nb) break;
+      buf = nb;
+      cap = newCap;
+    }
+    len += stream->readBytes(buf + len, min(avail, cap - len));
+  }
+  http.end();
+  if (len == 0 || (total > 0 && (int)len != total)) {
+    free(buf);
+    len = 0;
+    return nullptr;
+  }
+  return buf;
 }

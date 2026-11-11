@@ -1,6 +1,8 @@
 #pragma once
 #include <Arduino.h>
 
+#include <atomic>
+
 // What the display needs to know about the current playback
 struct NowPlaying {
   bool isPlaying = false;
@@ -21,10 +23,11 @@ enum class PollResult {
   NetError         // temporary problem, just try again later
 };
 
+// Thread-safe: the network task and the web server may call it at the same time.
 class SpotifyClient {
  public:
   void begin();  // loads the saved refresh token from flash
-  bool hasRefreshToken() const { return _refresh.length() > 0; }
+  bool hasRefreshToken() const { return _loggedIn.load(); }
 
   String authorizeUrl() const;  // URL the user opens to log in
   // Exchange the ?code=... from the redirect for tokens (stored in flash)
@@ -44,8 +47,14 @@ class SpotifyClient {
   bool tokenRequest(const String& body, String& err);
   void saveRefreshToken(const String& token);
 
+  SemaphoreHandle_t _mtx = nullptr;
+  std::atomic<bool> _loggedIn{false};
   String _refresh;
   String _access;
   uint32_t _accessExpiresAt = 0;
   uint32_t _retryAfterMs = 5000;
 };
+
+// Downloads a whole file (e.g. a JPEG cover) into a malloc'ed buffer.
+// Returns nullptr on failure. Caller must free() the buffer.
+uint8_t* httpDownload(const String& url, size_t& len, size_t maxSize);
