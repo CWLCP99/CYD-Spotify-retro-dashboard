@@ -4,17 +4,7 @@ A mini "now playing" screen for the **ESP32-2432S028R** (Cheap Yellow Display):
 album cover, title / artist / album, a live progress bar, and touch buttons for
 previous / play-pause / next.
 
-```
-+----------+-----------------+
-|  album   | Title           |
-|  cover   | Artist          |
-|          | Album           |
-+----------+-----------------+
-| ======progress========     |
-| 1:23                  3:45 |
-|    |<      (>)      >|     |
-+----------------------------+
-```
+![alt text](image.png)
 
 ## 1. Create a Spotify app (5 min)
 
